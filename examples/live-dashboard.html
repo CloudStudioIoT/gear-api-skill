@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gear live view</title>
+<!--
+  One-file frontend on the Gear API: log in, pick a facility, list its devices, open one to see live values.
+  Run it through the local proxy, which serves this folder and forwards the API calls to your instance:
+    GEAR_URL=https://gear.example.com node dev-proxy.mjs   ->  http://localhost:8080/live-dashboard.html
+  A browser cannot call the Gear Service API from another origin (the CORS preflight is refused), so the
+  page always talks to its own origin.
+-->
+<style>
+  :root { color-scheme: light dark; --line: #8884; --muted: #888; --ok: #2a9d4b; --bad: #d1443c; }
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 0 auto; max-width: 960px; padding: 16px; }
+  form, .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+  input, select, button { font: inherit; padding: 6px 8px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  tr.click { cursor: pointer; }
+  .on { color: var(--ok); } .off { color: var(--bad); } .muted { color: var(--muted); }
+  #error { color: var(--bad); white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Gear live view</h1>
+
+<form id="login">
+  <input id="app" placeholder="Application token" required size="36">
+  <input id="email" type="email" placeholder="E-mail" required autocomplete="username">
+  <input id="password" type="password" placeholder="Password" required autocomplete="current-password">
+  <button>Log in</button>
+</form>
+
+<div class="bar" id="facilityBar" hidden>
+  <label>Facility <select id="facility"></select></label>
+  <button id="logout" type="button">Log out</button>
+</div>
+
+<div id="error"></div>
+<div id="devices"></div>
+<div id="device"></div>
+
+<script type="module">
+import { GearClient, parseGearDate } from './gear-client.mjs';
+
+const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const ago = (value) => {
+  const d = parseGearDate(value);
+  if (!d || d.getUTCFullYear() < 2000) return 'never';
+  const h = (Date.now() - d.getTime()) / 3.6e6;
+  return h < 1 ? `${Math.round(h * 60)} min ago` : h < 48 ? `${Math.round(h)} h ago` : `${Math.round(h / 24)} days ago`;
+};
+const show = (e) => { $('error').textContent = e ? String(e.message || e) : ''; };
+
+let gear = null;
+
+// The token lives only for this browser tab.
+function saved() {
+  try { return JSON.parse(sessionStorage.getItem('gear') || 'null'); } catch { return null; }
+}
+
+async function start(base, token) {
+  gear = new GearClient(base, token);
+  $('login').hidden = true;
+  $('facilityBar').hidden = false;
+  const facilities = await gear.service('core/FacilityService', 'EnumAccountFacilities', { accountID: 0 });
+  $('facility').innerHTML = facilities
+    .sort((a, b) => a.Description.localeCompare(b.Description))
+    .map((f) => `<option value="${f.FacilityID}">${esc(f.Description)}</option>`).join('');
+  if (facilities.length) await loadDevices(facilities[0].FacilityID);
+}
+
+async function loadDevices(facilityID) {
+  $('device').innerHTML = '';
+  const devices = await gear.service('core/DeviceService', 'EnumDevices', { facilityID: Number(facilityID) });
+  $('devices').innerHTML = `<table><tr><th>Device</th><th>Model</th><th>Status</th><th>Last data</th></tr>${
+    devices.map((d) => `<tr class="click" data-id="${d.DeviceID}">
+      <td>${esc(d.Description)}</td><td class="muted">${esc(d.DeviceModel)}</td>
+      <td class="${d.IsOnline ? 'on' : 'off'}">${d.IsOnline ? 'online' : 'offline'}</td>
+      <td>${esc(ago(d.LastDataDateTime))}</td></tr>`).join('')
+  }</table>`;
+}
+
+async function loadDevice(deviceID) {
+  const data = await gear.service('core/DeviceService', 'GetDeviceLiveData', { deviceID: Number(deviceID) });
+  const d = data.Device;
+  $('device').innerHTML = `<h2>${esc(d.Description)}</h2>
+    <p class="muted">Last update ${esc(d.LastUpdate)} · ${d.AlarmCount} open alarm(s)</p>
+    <table><tr><th>Endpoint</th><th>Value</th></tr>${
+      d.Endpoints.map((e) => `<tr><td>${esc(e.ExtendedEndpoint.Description)}</td>
+        <td class="${e.IsOnline ? '' : 'muted'}">${esc(e.Value)} ${esc(e.ValueUnit)}</td></tr>`).join('')
+    }</table>`;
+}
+
+$('login').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  show();
+  try {
+    const base = location.origin; // the proxy (or your own reverse proxy) forwards /api and /services
+    const client = new GearClient(base);
+    await client.login($('app').value.trim(), $('email').value.trim(), $('password').value, 8 * 3600);
+    $('password').value = '';
+    try { sessionStorage.setItem('gear', JSON.stringify({ base, token: client.accessToken })); } catch {}
+    await start(base, client.accessToken);
+  } catch (e) { show(e); }
+});
+
+$('facility').addEventListener('change', (ev) => loadDevices(ev.target.value).catch(show));
+$('devices').addEventListener('click', (ev) => {
+  const row = ev.target.closest('tr[data-id]');
+  if (row) loadDevice(row.dataset.id).catch(show);
+});
+$('logout').addEventListener('click', () => {
+  try { sessionStorage.removeItem('gear'); } catch {}
+  location.reload();
+});
+
+const s = saved();
+if (s) {
+  start(s.base, s.token).catch((e) => {
+    show(e);
+    try { sessionStorage.removeItem('gear'); } catch {}
+    $('login').hidden = false;
+    $('facilityBar').hidden = true;
+  });
+}
+</script>
+</body>
+</html>
